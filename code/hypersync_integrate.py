@@ -1,0 +1,304 @@
+"""
+Functions to simulate the synchronisation 
+of oscillators with group interactions
+"""
+
+from math import sin
+
+import numpy as np
+import xgi
+from scipy.integrate import solve_ivp
+from numba import jit
+
+
+__all__ = [
+    "rhs_ring_nb",   
+    "simulate_kuramoto", 
+    "rhs_oneloop_nb_quadruplet", 
+    "rhs_oneloop_nb_asym",  
+    "rhs_oneloop_SC_nb",  
+    "rhs_ring_harmonics_nb",  
+    "rhs_23_sym",  
+]
+
+
+@jit(nopython=True)
+def rhs_ring_nb(t, theta, omega, k1, k2, r1, r2, alpha, beta):
+    """
+    Coupling functions :
+    * sin(oj - oi)
+    * sin(oj + ok - 2oi)
+
+    Parameters
+    ----------
+    t : float
+        Time of integration
+    omega : float or array of floats
+        Natural frequencies of oscillators
+    k1, k2 : int
+        Pairwise and triplet coupling strengths
+    r1, r2 : int
+        Coupling range for pairwise and triplet interactions on the ring
+    """
+
+    N = len(theta)
+
+    local_order = np.zeros(N, dtype=np.complex64)
+    phases = theta
+    for ii in range(N):
+        for j in range(-r2, r2 + 1):
+            idx = (ii + j) % N
+            local_order[ii] += np.exp(1j * phases[idx])
+    
+    local_order /= (2 * r2 + 1)
+    local_order = np.abs(local_order)  
+    O_alpha = local_order ** alpha  
+    O_beta = local_order ** beta    
+
+
+    pairwise = np.zeros(N)
+    triplets = np.zeros(N)
+
+    idx_2 = list(range(-r2, 0)) + list(range(1, r2 + 1))
+    idx_1 = range(-r1, r1 + 1)
+
+    for ii in range(N):
+        for jj in idx_1:  
+            jjj = (ii + jj) % N
+            pairwise[ii] += sin(theta[jjj] - theta[ii])
+
+        for jj in idx_2:  
+            for kk in idx_2:
+                if jj < kk:  
+                    jjj = (ii + jj) % N
+                    kkk = (ii + kk) % N
+                    triplets[ii] += 2 * sin(theta[kkk] + theta[jjj] - 2 * theta[ii])
+
+    return (k1 * O_alpha / r1) * pairwise + k2 * O_beta / (r2 * (2 * r2 - 1)) * triplets
+
+
+def simulate_kuramoto(
+    H,
+    k1,
+    k2,
+    omega=None,
+    theta_0=None,
+    t_end=100,
+    dt=0.01,
+    rhs=None,   
+    integrator="explicit_euler",
+    args=None,
+    t_eval=False,
+    **options
+):
+    
+
+    H = xgi.convert_labels_to_integers(H, "label")
+    N = H.num_nodes
+
+    if omega is None:
+        omega = np.random.normal(0, 1, N)
+
+    if theta_0 is None:
+        theta_0 = np.random.random(N) * 2 * np.pi
+
+    if rhs is None:
+        rhs = rhs_lucas
+
+    times = np.arange(0, t_end + dt / 2, dt)
+    n_t = len(times)
+
+    t_eval = None if not t_eval else times
+
+    thetas = np.zeros((N, n_t))
+    thetas[:, 0] = theta_0
+
+    if integrator == "explicit_euler":
+        for it in range(1, n_t):
+            thetas[:, it] = thetas[:, it - 1] + dt * rhs(
+                0, thetas[:, it - 1], omega, k1, k2, *args
+            )
+    else:
+        thetas = solve_ivp(
+            fun=rhs,
+            t_span=[times[0], times[-1]],
+            y0=theta_0,
+            t_eval=times,
+            method=integrator,
+            args=(omega, k1, k2, *args),
+            **options
+        ).y
+
+    return thetas, times
+
+
+@jit(nopython=True)
+def rhs_oneloop_nb_quadruplet(t, theta, omega, k1, k2, r1, r2):
+
+    N = len(theta)
+
+    pairwise = np.zeros(N)
+    triplets = np.zeros(N)
+
+    idx_2 = list(range(-r2, 0)) + list(range(1, r2 + 1))
+    idx_1 = range(-r1, r1 + 1)
+
+    for ii in range(N):
+        for jj in idx_1:  
+            jjj = (ii + jj) % N
+            pairwise[ii] += sin(theta[jjj] - theta[ii])
+
+        for jj in idx_2: 
+            for kk in idx_2:
+                for ll in idx_2:
+                    if jj != kk and jj != ll and kk != ll:
+                        jjj = (ii + jj) % N
+                        kkk = (ii + kk) % N
+                        lll = (ll + jj) % N
+                        triplets[ii] += sin(
+                            theta[lll] + theta[kkk] + theta[jjj] - 3 * theta[ii]
+                        )
+
+    g2 = (1 / 3) * r2 * (2 * r2 - 2) * (2 * r2 - 1)  
+    return (k1 / r1) * pairwise + k2 / g2 * triplets
+
+
+@jit(nopython=True)
+def rhs_oneloop_nb_asym(t, theta, omega, k1, k2, r1, r2):
+
+    N = len(theta)
+
+    pairwise = np.zeros(N)
+    triplets = np.zeros(N)
+
+    idx_2 = list(range(-r2, 0)) + list(range(1, r2 + 1))
+    idx_1 = range(-r1, r1 + 1)
+
+    for ii in range(N):
+        for jj in idx_1:  
+            jjj = (ii + jj) % N
+            pairwise[ii] += sin(theta[jjj] - theta[ii])
+
+        for jj in idx_2:  
+            for kk in idx_2:
+                if jj != kk:
+                    jjj = (ii + jj) % N
+                    kkk = (ii + kk) % N
+                    triplets[ii] += sin(2 * theta[kkk] - theta[jjj] - theta[ii])
+
+    return (k1 / r1) * pairwise + k2 / (r2 * (2 * r2 - 1)) * triplets
+
+
+@jit(nopython=True)
+def rhs_oneloop_SC_nb(t, theta, omega, k1, k2, r1, r2):
+
+    N = len(theta)
+
+    pairwise = np.zeros(N)
+    triplets = np.zeros(N)
+
+    idx_2 = list(range(-r2, 0)) + list(range(1, r2 + 1))
+    idx_1 = range(-r1, r1 + 1)
+
+    for ii in range(N):
+        for jj in idx_1:  
+            jjj = (ii + jj) % N
+            pairwise[ii] += sin(theta[jjj] - theta[ii])
+
+        for jj in idx_2:  
+            for kk in idx_2:
+                if (jj < kk) and (kk - jj) <= r2:
+                    jjj = (ii + jj) % N
+                    kkk = (ii + kk) % N
+                    triplets[ii] += 2 * sin(theta[kkk] + theta[jjj] - 2 * theta[ii])
+
+    g2 = (r2 * (2 * r2 - 1)) / 2 
+    return (k1 / r1) * pairwise + k2 / g2 * triplets
+
+
+@jit(nopython=True)
+def rhs_ring_harmonics_nb(t, theta, omega, k1, k2, r1):
+
+    N = len(theta)
+
+    first = np.zeros(N)
+    second = np.zeros(N)
+
+    idx_1 = range(-r1, r1 + 1)
+
+    for ii in range(N):
+        for jj in idx_1: 
+            jjj = (ii + jj) % N
+            first[ii] += sin(theta[jjj] - theta[ii])
+            second[ii] += sin(2 * theta[jjj] - 2 * theta[ii])
+
+    return (k1 / r1) * first + (k2 / r1) * second
+
+
+def rhs_23_sym(t, psi, omega, k1, k2, links, triangles, alpha, beta):   
+
+    N = len(psi)
+    pairwise = np.zeros(N)
+    triplet = np.zeros(N)
+    O_i = each_local_parameter(N, psi, links, triangles)   
+
+    for i, j in links:
+        oi = psi[i]
+        oj = psi[j]
+        pairwise[i] += sin(oj - oi)
+        pairwise[j] += sin(oi - oj)
+
+    for i, j, k in triangles:
+        oi = psi[i]
+        oj = psi[j]
+        ok = psi[k]
+        triplet[i] += 2 * sin(oj + ok - 2 * oi)
+        triplet[j] += 2 * sin(oi + ok - 2 * oj)
+        triplet[k] += 2 * sin(oj + oi - 2 * ok)
+
+    k1_avg = len(links) / N * 2
+    k2_avg = len(triangles) / N * 3
+    O_alpha = O_i ** alpha 
+    O_beta = O_i ** beta    
+
+    return omega + (k1 / k1_avg)  * O_alpha * pairwise + (k2 / (k2_avg * 2)) * O_beta * triplet
+
+
+def each_local_parameter(N, aux, links, triangles):
+
+    O_i = np.zeros(N)
+    Real = np.zeros(N)
+    Im = np.zeros(N)
+    norm = np.zeros(N)
+
+    for i, j in links:
+        dif_ij = aux[j] - aux[i]
+        Real[i] += np.cos(dif_ij)
+        Im[i]   += np.sin(dif_ij)
+        norm[i] += 1
+
+        dif_ji = aux[i] - aux[j]
+        Real[j] += np.cos(dif_ji)
+        Im[j]   += np.sin(dif_ji)
+        norm[j] += 1
+
+    for i, j, k in triangles:
+        dif_i = aux[j] + aux[k] - 2 * aux[i]
+        dif_j = aux[i] + aux[k] - 2 * aux[j]
+        dif_k = aux[i] + aux[j] - 2 * aux[k]
+
+        Real[i] += np.cos(dif_i)
+        Im[i]   += np.sin(dif_i)
+        norm[i] += 1
+
+        Real[j] += np.cos(dif_j)
+        Im[j]   += np.sin(dif_j)
+        norm[j] += 1
+
+        Real[k] += np.cos(dif_k)
+        Im[k]   += np.sin(dif_k)
+        norm[k] += 1
+
+    mask = norm > 0
+    O_i[mask] = np.sqrt(Real[mask]**2 + Im[mask]**2) / norm[mask]
+    return O_i
